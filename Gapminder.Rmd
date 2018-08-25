@@ -1,0 +1,813 @@
+---
+title: "An interactive exploratory analysis of worldly socioeconomic progress"
+author: "Voss, E., Vrieze, J., Maegaard M."
+date: "Due Thurs. May 10, 2018"
+output:
+  html_document: default
+  pdf_document: default
+font: 12pt
+---
+
+## Introduction
+
+This project utilizes a culmination of various statistical computing techniques developed in STAT 345 at the University of Wisconsin - La Crosse. Specifically, it touches on creating and using a database structure, SQL, data cleansing, and web scraping. From external research, it also goes in-depth on techniques to observe and handle missing values, as well as creating animated graphs whose structures are based in _ggplot_ and _dplyr_.  
+
+The analysis as a whole is built on data from [Gapminder](https://www.gapminder.org/), a wonderful compilation of world data by the famous Sweedish statistician and world health expert, Hans Rosling. His ideas also served as a major inspiration to several of the interactive graphs included in this project, which are accompanied by detailed summaries, progressive insights, and important statistics.  
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+```
+
+```{r pressure, out.width = '100%'}
+wdbase <- '/Users/mitchmaegaard/STAT345' # 'STAT345' -- folder with ALL gapminder data
+altdest <- '/Users/mitchmaegaard/STAT345/Codes/' # location for 'country_coords'
+# screenshot of website, add pic using it's link. Useful to show what we were working with
+knitr::include_graphics(paste0(wdbase, '/gapminder_data.png'))
+```
+
+## Data collection
+
+With the function _setup_, we're extrapolating 31 data sets from over 550 that were available [Gapminder](https://www.gapminder.org/data/) in the form of excel files (.xlsx), each of which included several tabs of data explanation.  
+
+We converted these to a more workable file (.csv), then created a database with all the files we wanted. Amazingly enough, we were able to make this task extremely replicable by having the only argument specifying the working directory that we were working in (after adding the .csv files that we wanted to grab into the directory).  
+
+```{r}
+setup <- function(wd = wdbase){
+  
+  packages <- c('plyr','DBI','RSQLite','dbplyr','dplyr','reshape','RCurl','ggplot2','rworldmap','RColorBrewer','cowplot','gganimate','animation','magick','ggcorrplot','reshape2','VIM','naniar','ggalt','GGally','maps','rpart','rpart.plot','DMwR','scales','ggthemes','kableExtra')
+  lapply(packages, require, character.only = TRUE)
+  
+  # Get necessary packages
+  #library(dplyr); library(DBI); library(RSQLite); library(dbplyr); library(plyr); library(reshape); library(RCurl); library(ggplot2); library(rworldmap); library(RColorBrewer); library(cowplot); library(gganimate); library(animation); library(magick); library(ggcorrplot); library(reshape2); library(VIM); library(naniar); library(ggalt); library(GGally); library(maps); library(rpart); library(rpart.plot); library(DMwR); library(scales); library(ggthemes)
+  
+  # For mac users, load imagemagick (for moving plots) in terminal:
+    #/usr/bin/ruby -e "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/master/install)"
+    #brew install imagemagick
+  
+  setwd(wd) # Specify correct workspace!
+  files <- list.files(pattern = '*.csv') # Grab all csv files from directory
+  rdf <- lapply(files, read.csv) # Read in all files
+  files <- gsub('.csv|_','',files) # Get base names of files
+  
+  con <- dbConnect(SQLite(), dbname = 'world.db') # Create a new database
+  
+  # Make sure we start out with a clean database! Useful for reproducability
+  for(i in 1:length(files))
+    dbRemoveTable(conn = con, name = files[i])
+  
+  # Copy files to database, figure out how to do this without a loop!
+  for(i in 1:length(files))
+    dbWriteTable(conn = con, name = files[i], value = rdf[[i]], row.names = FALSE)
+  
+  return(con)
+}
+con <- setup() # Make db connection
+dbListTables(con) # Show files
+
+# show the inital structure of a table BEFORE any cleaning
+kable(tbl(con, 'AidReceivedTotal'), 'html') %>%
+  kable_styling(bootstrap_options = c('striped', 'hover', 'condensed', 'resonsive')) %>%
+  scroll_box(width = "100%", height = "200px")
+```
+
+Once the database was set up, we were able to start looking at the structures of each table to see how we would need to structure the cleaning procedure. From there, we wanted to melt the data such that each country was listed in the first column, followed by the year in the second column, and the metric the data set was specifying in the final column. One important thing to note here was that we chose to only keep the years 1990 to 2010. For the analysis we had in mind, 20 years was going to be plenty of data to work with (especially considering we had it coming from all countries). We also found that data entry for several metrics didn't begin until the 90's, with only a few dating back further on a consistent basis; thus, we decided to use 1990 as our cutoff year.  
+
+```{r}
+format_df <- function(name){
+  # This function will take in the name of a table from our database, then mutate it into a more workable fasion
+  as.data.frame(tbl(con, name)) %>% # Get data for each table in database and convert to df
+  rename_(Country = names(.)[1]) %>% # Rename junk in 1st col to 'country'
+  filter(Country != '') %>% # remove empty rows (if any)
+  melt(., id = 'Country') %>% # restructure data
+  rename(c('variable' = 'Year', 'value' = name)) %>% # rename variables to make output easier to understand
+  mutate(Year = as.numeric(gsub('X','',Year))) %>% # remove 'X' from front of years
+  arrange(Country, Year) %>% # change grouping
+  filter(Year >= 1990 & Year <= 2010) # keep only years 1990 to 2010
+}
+
+kable(format_df('AidReceivedTotal'), 'html') %>%
+  kable_styling(bootstrap_options = c('striped', 'hover', 'condensed', 'resonsive')) %>%
+  scroll_box(width = "100%", height = "200px")
+```
+
+Now that we have a format to restructure our tables, we use another method _var join_ that will utilize _format df_ to restructure all 31 tables in our database. After each table is restructured, it will be joined to the previous (cumulative) table by matching country and year. Thus, after the initial table is set up, we are basically going to keep a single column with a new metric added on to the existing ones.  
+
+```{r}
+var_join <- function(name){
+  # Use 'format_df' function to create list of cleaned dataframes from all variables
+  df.list <- lapply(name, format_df)
+  df.full <- df.list[[1]] # base for starting merge
+  # Use left join to preserve all possible year/country combos -- without a loop?
+  for(i in 2:length(df.list))
+    df.full <- df.full %>% left_join(df.list[[i]], by = c('Country','Year'), copy = TRUE)
+  # Remove commas from 'TotalPopulation'. Convert to num. Replace missing with NA
+  df.full %>% mutate(TotalPopulation = as.numeric(gsub(',','',TotalPopulation)))
+}
+
+kable(var_join(dbListTables(con)), 'html') %>%
+  kable_styling(bootstrap_options = c('striped', 'hover', 'condensed', 'resonsive')) %>%
+  scroll_box(width = "100%", height = "200px")
+```
+
+As we can see, a lot of the metrics have missing values; in fact, _Abkhazia_, the country appearing first, doesn't have a single variable with data for all 21 years. We work on cleaning this up a little bit later, but for now we'll want to add in a little extra information to assist in grouping and graphing.  
+
+In order to match the countries in our dataset uniformly with others, our next step was to scrape country codes from [statoids](http://www.statoids.com/wab.html). On this website, we were provided with information from 249 countries across the world, in accordance with the international standard ISO 3166-1, as can be seen below:  
+
+```{r, out.width = '100%'}
+# screenshot of website, add pic using it's link. Useful to show what we were working with
+knitr::include_graphics(paste0(wdbase, '/statoid_website.png'))
+```
+
+```{r}
+get_codes <- function(URL = 'http://www.statoids.com/wab.html', line = 'u[a-z]{2}.html', code = 'code>[0-9]{3}', country = 'html\">.*<', code.parse = 'code>', country.parse = '(html\">)(([^\x01-\x7F]|[A-Z])+.*)(</a.*)'){
+  html <- getURL(URL)
+  write(html, file = 'world.html')
+  page <- readLines('world.html')
+  lines <- grep(page, pattern = line)
+  code.match <- gregexpr(code, page[lines])
+  country.match <- gregexpr(country, page[lines])
+  codes <- regmatches(x=page[lines],m=code.match)
+  countries <- regmatches(x=page[lines],m=country.match)
+  codes <- gsub(code.parse,'',codes)
+  countries <- gsub(country.parse,'\\2',countries)
+  countries <- gsub('<br>',' ', countries) # Replace line break with space
+  countries <- gsub('(<){1}.*','',countries) # Why is this not working above?
+  
+  ccode <- cbind.data.frame(countries, codes)
+  names(ccode) <- c('Country','Code')
+  # Drop last row -- not sure how the regex is picking it up?
+  return(ccode[-250,])
+}
+
+kable(get_codes(), 'html') %>%
+  kable_styling(bootstrap_options = c('striped', 'hover', 'condensed', 'resonsive')) %>%
+  scroll_box(width = "100%", height = "200px")
+```
+
+After utilizing a few regular expressions and general text parsing techniques, we ended up with a table of countries and their respecive numeric-code values. This table can be compared to the snapshot from the website, validating the accuracy of our matching techniques.  
+
+After an attempt to merge this table of codes with the one we had already created, we ran into the problem of country names differing by spelling, syntax, and formatting. To solve this issue, instead of searching through the data and renaming countries on an individual basis, we decided to take a more efficient route. For this method, we indexed the rows that had discrepancies, created a table of unmatched countries, then re-arranged a single column to match the names, so a simple swap between the two could be performed to get the correct name and code pairing. We then pushed these swaps into a function, _replace names_ to keep our working environment free of the extra clutter and to make it easier to utilize in the next step of merging all of the data together.  
+
+```{r}
+replace_names <- function(world, codes){
+  
+  # Find what countries aren't matching -- 65
+  missingCountries <- world %>%
+    distinct(Country) %>%
+    left_join(codes, by = 'Country', copy = TRUE) %>%
+    filter(is.na(Code))
+  
+  curNames <- missingCountries$Country # Get only Country names
+  # Drop ones that still aren't matched
+  curNames <- curNames[-c(1,2,6,7,8,9,20,21,23,30,35,36,37,42,44,55,57,61,63,65)]
+  curNames <- curNames[-c(9,10,11,20,22,23,25,26,30,35,42,45)]
+  # I apologize for the ugly indexing here, I was going to clean up this process but ran out of time...
+  
+  # Get names from what we want to change them to -- 39
+  foundCountries <- codes %>% anti_join(world, by='Country', copy = TRUE) # 'all rows from x without matching y values'
+
+  newNames <- as.character(foundCountries$Country)
+  newNames <- newNames[-c(2,12,13,22,33,37)]
+  
+  # Indices of matched names
+  newIndex <- c(1,2,3,4,6,5,7,8,10,9,11,14,15,16,17,18,12,19,27,28,13,20,21,22,23,24,26,25,29,30,31,32,33)
+
+  # Swap around old names to get them to match up in the same rows
+  for(i in 1:length(newIndex))
+    newNames[i] <- newNames[newIndex[i]]
+  
+  # Replace old names with new names
+  for(i in 1:33)
+    world <- world %>% mutate(Country = ifelse(Country == curNames[i], newNames[i], Country))
+  
+  return(world)
+}
+#replace_names(var_join(dbListTables(con)), get_codes()) %>% glimpse()
+```
+
+What we end up with is a table that appears similar to the one from before, with the only difference being 39 countries that underwent name changes. Our next step is to add the numeric codes to the matched countries.  
+
+After an initial setup of using only countries and numeric codes, we wanted a better method of grouping; after a little searching, we found a file online that contained country names, numeric codes, alpha codes, regions (continents), and subregions. Because a few of the country names differed, we matched numeric codes to add the new information to our dataset. However, after even further exploration, we found that we would need a way to graph countries on a map. The most visually appealing method of setting up a world graph and adding country data to it would be to use coordinates. So, we found yet another file that contained country codes and latitude and longitude positions for country mid-points, and also matched these to our data. We created the function _create full_ that utilized our previous data cleaning and merging functions, along with merging in the new code and coordinate tables.  
+
+```{r}
+create_full <- function(file1 = paste0(altdest, 'AllCountries.csv'), file2 = paste0(altdest, 'country_coords.csv')){
+  # Country data from https://github.com/lukes/ISO-3166-Countries-with-Regional-Codes/blob/master/all/all.csv
+  
+  # Read in data table with country names, codes, and regions
+  countries <- read.csv(file1, header = TRUE) %>%
+    rename(c('country.code' = 'Code', 'region' = 'Region', 'sub.region' = 'Subregion')) %>%
+    mutate(Code = as.factor(Code))
+  
+  coords <- read.csv(file2, header = TRUE) %>%
+    select(-c(Country, Alpha.2.code)) %>%
+    rename(c('Alpha.3.code' = 'ISO3', 'Numeric.code' = 'Code', 'Latitude..average.' = 'Lat', 'Longitude..average.' = 'Long')) %>%
+    mutate(ISO3 = as.factor(gsub('^\\s+','',ISO3)))
+  
+  # Grab all codes from previous function and merge them together
+  codes <- get_codes() %>%
+    mutate(Code = as.factor(gsub('^0{0,2}','', Code))) %>%
+    inner_join(countries, by = 'Code', copy = TRUE) %>%
+    select(Country, Code, Region, Subregion) %>%
+    mutate(Code = as.integer(Code)) %>%
+    inner_join(coords, by = 'Code', copy = TRUE)
+  
+  # Add regions and sub-regions to full data set
+  world <- replace_names(var_join(dbListTables(con)), get_codes()) %>%
+    inner_join(codes, by = 'Country', copy = TRUE) %>%
+    mutate(Country = as.factor(Country), InfantMortality = as.double(InfantMortality)) %>%
+    select(Country, ISO3, Code, Region, Subregion, Lat, Long, everything()) %>% # Regroup the columns
+    select(-c(AidReceivedTotal, Doctors, TotalHealthSpending, Employed, LongTermUnemployment, GDPTotal, TotalGNI, PeopleWithHIV))
+  
+  # NOTE: only returns data from countries with codes. Fine b/c other countries will be too small to have any significant data
+  return(world)
+}
+# This is our full working data set!
+world <- create_full()
+
+kable(world, 'html') %>%
+  kable_styling(bootstrap_options = c('striped', 'hover', 'condensed', 'resonsive')) %>%
+  scroll_box(width = "100%", height = "200px")
+
+# write.csv(world, file = 'world.csv', row.names = FALSE) # write out our final file to share
+```
+
+After this step, we get a complete table of almost every country from 1990 to 2010, a span of 21 years. If we had an entire set, we would expect 5,229 observations (249 countries x 21 years). Taking a quick peek at the actual dimensions, we can see that we are only missing 42 observations, which corresponds to 2 countries over the course of 21 years. This is alright because the two countries we lost were likely too small to have any data assoicated with them. We can confirm this assumption later by observing a world graph and seeing if any significant countries show up as "blank", indicating that we missed them in our data collection.  
+
+## Handling missing values
+
+After a good amount of time spent on data exploration, mainly in terms of looking at missing values, correlations, and density plots, we decided it would be best to return to this step and remove a few variables that (a) we didn't think would be extremely useful due to the lack of presence, and (b) we didn't have enough time to delve in too deeply on all the possibilities that existed with the data harvested from around the world on Gapminder. However, we didn't want to remove these tables from our database in the earlier step so that we could use them in the future. A breif summary on why different variables were removed are given as follows.  
+
+_"AidReceivedTotal"_ and _"TotalHealthSpending"_ were duplicates of _"HealthExpenditure"_. We got rid of these because they had more missing values, and included some estimations (provided by __Gapminder__) from countries that didn't have original data and information. _"Doctors"_ were excluded for the significant amount missing. _"Employed"_ and _"LongTermUnemployment"_ were highly correlated with _"EmploymentRate"_ and _"UnemploymentRate"_ (respecively), but didn't give us as much detail as the 'rate' metrics. Likewise, _"GDPTotal"_ and _"TotalGNI"_ had similar relations with _"GDPPerCapita"_ and _"GNIPerCapita"_. The same went for _"PeopleWithHIV"_ in concurrence with the variate _"HIV"_.  
+
+Of the variables that we thought could be insightful and wanted to investigate further, we first wanted to observe missing values and figure out how to deal with these. Probably the most common plot to display missing data is with a "shadow matrix", which is basically a plot that fills in every row-column pair on a binary response if we have data present at that point or not. However, this can be very confusing to look at, takes a bit of explanation to grasp what's going on, and doesn't give much concrete inight as to quantifying the absences. Instead, we wanted to show the percent missing by each variable, as this would give us a better metric and a slightly easier method of explaining the variables we were dealing with.  
+
+```{r}
+gg_miss_var(select(world, -c(Code, Country, ISO3, Lat, Long, Region, Subregion, Year)), show_pct = T) +
+  # add a box highlighter around the missing data that are high (>50%)
+  geom_rect(aes(xmin = 0, xmax = 23.5, ymin = 50, ymax = 100), color = 'whitesmoke', fill = 'firebrick3', alpha = .005) +
+  geom_hline(yintercept = 50, lty = 2, color = 'firebrick3') +
+  annotate('text', x = 1.5, y = 75, label = '"Danger Zone"', family = 'Helvetica', size = 7, color = 'firebrick3') +
+  theme(plot.title = element_text(colour = "steelblue4", size = rel(1.8), face = "bold", family = "Helvetica"),
+        axis.title = element_text(colour = "steelblue4", size = rel(1.5), family = "Helvetica"),
+        axis.text.y = element_text(colour = "steelblue3", size = rel(.9), family = "Helvetica"),
+        axis.text.x = element_text(color = 'steelblue3', size = rel(1.2), face = 'bold', family = 'Helvetica')) +
+  labs(y = '% Missing Values', title = 'Where is our missing data coming from?')
+
+# miss_var_summary(world) # table with the visual presented in the graph above
+#ggsave('MissingValues.png', plot = last_plot())
+```
+
+As we can see, the variables are plotted such that they have an increasing percentage missing, with the five at the top falling into what we labeled the _"danger zone"_, or those having more than __50%__ missing. When this much data is absent, we need to be careful using these metrics in summaries, as they will not give an accurate representation of the population.  
+
+After discovering __where__ we had missing values, the next step was attempting to gain a deeper understanding of __why__ they were missing. Some research and exploration lead us to an attempt to model the missingness with decision trees, which would classify and highlight what factors were the best indicators of where our data was missing. Before we did this, we needed to add a response variable that would serve as the root node for classifications and other factors for the tree to partition on. After an initial attempt, we also decided to leave out country names, codes, subregions, and coordinates in our classification; because these metrics are unique, they don't have good splitting values and would create unnecessary complexity in the tree.  
+
+With research and testing several different classification methods, recursive partitioning and regression tree _(rpart)_ analysis seemed to be the best fit for our data. This routine builds classification or regression models of a very general structure using a two-stage procedure; the resulting models can be represented as binary trees (yes/no responses to a simple question at each node). The tree is built by the following process: first, a single variable is found which best splits the data into two groups. The data is separated, and then this process is applied separately to each sub-group, and so on recursively until the subgroups either reach a minimum size or until no improvement can be made. In our case, we utilized an anova method since _"Missing"_, the metric we wanted to classify, is numeric. Our stopping case will look for the tree with the highest cross-validated error less than the minimum cross-validated error plus the standard deviation of the error at that tree. In simpler terms, we want to get a good classification, but also keep the complexity of the tree to a minimum. We created a graph that will display a line at this point, drawn from an equation that makes use of the tree's CP table, a matrix of information on optimal prunings given a complexity parameter.  
+
+```{r}
+# Store the tree in a new variable
+big.tree <- world %>%
+  select(-c(Country, ISO3, Code, Subregion, Lat, Long)) %>% # drop names and codes b/c too much uniqueness
+  add_prop_miss() %>% # add a column for proportion missing in that ROW
+  rename(c('prop_miss_all' = 'Missing')) %>%
+  rpart(Missing ~ ., method = 'anova', data = .) # build the classification tree
+
+# Visualize the cross-validated results. Using info from `printcp(big.tree)` to display the results of the tree
+big.tree$cptable %>%
+  as.data.frame() %>%
+  ggplot(., aes(nsplit, xerror)) +
+    geom_point(shape = 9, color = 'blue', size = 2) +
+    geom_point(aes(max(nsplit), min(xerror)), color = 'red', size = 2.5, shape = 18) +
+    geom_line(color = 'blue', alpha = .3) +
+    geom_hline(aes(yintercept = with(., (xerror + xstd)[min(seq_along(xerror)[xerror == min(xerror)])])), color = 'red', lty = 3) +
+    theme_minimal() +
+    theme(plot.title = element_text(colour = "steelblue4", size = rel(1.6), face = "bold", family = "Helvetica"),
+          axis.title = element_text(colour = "steelblue4", size = rel(1.4), family = "Helvetica"),
+          axis.text = element_text(colour = "steelblue3", size = rel(1), family = "Helvetica")) +
+    labs(x = '\nNumber of Splits', y = 'Cross-Validated Error\n', title = 'Find optimal tree from cross-validated errors')
+
+#ggsave('TreeOptimization.png', plot = last_plot())
+```
+
+Using the procedure described above, along with our graphing technique, we find that the "optimal" tree occurs at tree 11, with 15 splits and a cross-validated error of approximately .303. Considering we had all of our variates go into the initial model, we can "trim" the tree by selecting the complexity parameter associated with the smallest cross-validated error, then getting rid of variables that won't be of much use.  
+
+```{r}
+# Automatically select the complexity parameter associated with the following call in 'cp = '
+trim.tree <- prune(big.tree, cp = big.tree$cptable[which.min(big.tree$cptable[,'xerror']),'CP'])
+# trim.tree$variable.importance to get variable importance in classification
+
+#rpart.plot(trim.tree, type = 4, extra = 0, branch.lty = 3, box.palette = 'RdYlGn')
+rpart.plot(trim.tree, box.palette = 'RdGn', cex = .6, main = 'Proportion of values missing by variable measures\n<~~~ Lower (Red)     ||     (Green) Higher ~~~>')
+```
+
+Making sense of the this tree, we look for the variable listed below each node and the value associated with that node; we move to the left the condition is true, and right if not. A move to the __right__ is also indicative that we have a __higher proportion__ of missing values at that split than if we were to go left. Therefore, the nodes with values at the base of the tree will be representative of the proportion of missing values after going through all of the splits, with higher proporitons on the right. Additionally, a more direct path from the root node to the base nodes indicate stronger predictor-variate relationships, which we can see as a difference between the left and right subtrees. To make the graph easier to interpret, we've color coded the map such that _darker greens indicate more missing values_, and darker reds indicate less missing.  
+
+Based on the splits in our tree, we can see that the classification ends up utilizing only 5 variables, with splits occurring at different values for each of them. This indicates that our tree (variable) trimming worked out the way we wanted. More importantly, the majority of splits are observed to be at total population values and regions, indicating that this is a highly significant variable in knowing which of our values are going to be missing. From this, we can summarize that lesser populated countries and regions have significantly more missing data, which leads us to believe that this data is not missing at random (NMAR).  
+
+Ideally, we would have preferred to use a random forest method, whose training algorithm applies the general technique of bootstrap aggregating (bagging). It does this repeated times, each time selecting a random sample with replacement of the training set (full data set in our case). This bootstrapping procedure leads to better model performance because it decreases the variance of the model, without increasing the bias that can be found in a deep tree that is overfit to it's data. However, random forest classifications do not handle missing values efficiently, doing so by simply performing row-wise deletion upon detection of a missing value. In our case, this would get rid of all but one observation, which will clearly not give the accurate classification that we're looking for. So, while this would be a more ideal method in general cases than the constant forward motion and decisions of recursive partitioning, the large amount of missing values are not handled as smoothly. This benefit, combined with it's simplicity in interpretation, makes recursive partitioning an effective model structure for us to use in this scenario.  
+
+A next step in missing value treatment could be to impute the missings with values such as 0, the mean or median, or by values estimated from a classification or regression analysis. However, because we classified our data to be NMAR, imputations will give false information and skew summary statistics and findings. As a final note for our method and classification analysis in general, we could evaluate the performance of the results with tools such as a confusion matrix or an ROC curve to identify and illustrate the diagnostic ability of a binary classifier system as its discrimination threshold is varied. This is unnecessary for our situation, as we are simply using these methods to give us a more complete view of the data and explore how we should handle our missing values, and not as a final outcome of the exploratory analysis.  
+
+## Data visualization
+
+Now that we finally have a complete picture of what our data looks like, we can start observing the status of the world in 1990, almost __30 years ago__. We will also show the progress of the world over 21 years, all the way up until 2010. The main goal of our research will be to look at common stereotypes and modern viewpoints of worldly aspects, and show the accuracies of these beliefs. As was mentioned before, _Gapminder_ was the main source of data collection; likewise, Hans Rosling, the compiler, data visionary, and world health expert, served as a major inspiration to the analysis.  
+
+We begin the 21-year journey by diving into a separation of one world into two. The emerging two are the __"western world"__, which has commonly been defined as _"long life, small family"_, and __"third world"__, or _"short life, large family"_. Several years ago, this may have been the case; but has this construct changed in recent years? Let's start by observing where we were in 1990.  
+
+```{r}
+ggplot(filter(world, !is.na(FertilityRate), !is.na(LifeExpectancy), !is.na(TotalPopulation), Region != '', Year == 1990), # clean up data
+       aes(FertilityRate, LifeExpectancy, size = TotalPopulation, color = Region)) + # frame for animation intervals
+  geom_point(alpha = .7) + # lighten bubbles
+  geom_smooth(inherit.aes = FALSE, aes(FertilityRate, LifeExpectancy), method = 'lm', se = FALSE, size = .7, lty = 4, color = 'paleturquoise3') +
+  ggtitle('The divide of worlds in 1990') +
+  theme_minimal() + # white background, light grey lines at major and minor tick marks. Not distracting, good for references
+  # set themes for title, axes text and labels, as well as legend title and text
+  theme(plot.title = element_text(colour = "steelblue4", size = rel(1.8), face = "bold", family = "Helvetica"),
+        axis.title = element_text(colour = "steelblue4", size = rel(1.5), family = "Helvetica"),
+        axis.text = element_text(colour = "steelblue3", size = rel(1.2), family = "Helvetica"),
+        legend.title = element_text(colour = "steelblue", size = rel(1.5), family = "Helvetica"),
+        legend.text = element_text(colour = "steelblue4", size = rel(1), face = "italic",  family = "Helvetica")) +
+  scale_x_continuous('\nFertility Rate (births per woman)') +
+  scale_y_continuous('Life Expectancy (years)\n', breaks = seq(40,85,5), limits = c(40,85)) + # specify tick marks
+  scale_size_area(guide = FALSE, max_size = 12)
+
+# ggsave('fertilityVlife.png', plot = last_plot())
+```
+
+```{r, eval=FALSE}
+# specify eval = FALSE so we don't inlcude this chunk in our presentation. Not necessary
+
+# find average life expectancies and fertility rates in 1990 for Africa, Europe, and the US (serve as reference points)
+world %>%
+  filter(Year == 1990, Region != '', !is.na(FertilityRate), !is.na(LifeExpectancy)) %>%
+  select(Region, FertilityRate, LifeExpectancy) %>%
+  group_by(Region) %>%
+  summarise_all(funs(mean))
+# US stats
+world %>% filter(Year == 1990, Country == 'United States of America') %>%
+  select(FertilityRate, LifeExpectancy) %>% summarise_all(funs(mean))
+```
+
+In the early 90's, we begin with an image that fits the two-world definition fairly accurately. The chart of fertility rate versus life expectancy at birth shows a strong decreasing linear trend, indicating that a negative relationship in life quality among those having more children. Africa is quite spread out, but sits with a regional average fertility rate of 5.84 births per woman and a life expectancy of 57.8 years, falling 15.7 years of life behind the average European country, and having an average of 3.8 more children than American women. This is quite a disturbing view, and we can clearly see the separation of countries and regions that shaped this viewpoint so many years ago. Let's now fast-forward over the next 20 years to see the changes that have been happening.  
+
+```{r}
+ani.record(reset = TRUE) # be sure to reset graphics beforehand to avoid any unwanted parameters
+gganimate(
+  ggplot(filter(world, !is.na(FertilityRate), !is.na(LifeExpectancy), !is.na(TotalPopulation), Region != ''), # clean up data
+         aes(FertilityRate, LifeExpectancy, size = TotalPopulation, color = Region, frame = Year)) + # frame for animation intervals
+    geom_text(aes(label = Year, x = 5, y = 65), size = 40, alpha = .2, color = 'grey94', family = 'Helvetica') +
+    geom_point(alpha = .7) + # lighten bubbles
+    ggtitle('The social definition of "third world"') +
+    theme_minimal() + # white background, light grey lines at major and minor tick marks. Not distracting, good for references
+    # set themes for title, axes text and labels, as well as legend title and text
+    theme(plot.title = element_text(colour = "steelblue4", size = rel(1.8), face = "bold", family = "Helvetica"),
+          axis.title = element_text(colour = "steelblue4", size = rel(1.5), family = "Helvetica"),
+          axis.text = element_text(colour = "steelblue3", size = rel(1.2), family = "Helvetica"),
+          legend.title = element_text(colour = "steelblue", size = rel(1.5), family = "Helvetica"),
+          legend.text = element_text(colour = "steelblue4", size = rel(1), face = "italic",  family = "Helvetica")) +
+    scale_x_continuous('\nFertility Rate (births per woman)') +
+    scale_y_continuous('Life Expectancy (years)\n', breaks = seq(40,85,5), limits = c(40,85)) + # specify tick marks
+    # additional breaks in population size, only 2 to begin with. 'comma' to change text formatting
+    scale_size_area(guide = FALSE, max_size = 12),
+    #scale_size_continuous(labels = comma, name = 'Country Population', breaks = c(1000000,250000000,500000000,1000000000)),
+  interval = .5, ani.width = 1000, ani.height = 500, title_frame = FALSE, 'fertilityVlife.mp4' # specifications for animation. increase window size, new pic every .4 secs
+)
+```
+
+<div class="video_container">
+  <video controls="controls" allowfullscreen="true">
+    <source src="/Users/mitchmaegaard/fertilityVlife.mp4" type="video/mp4">
+  </video> 
+</div>
+
+```{r, eval=FALSE}
+# Get stats for making comparisons in summary
+# World averages
+world %>% filter(Year == 2010, Region != '', !is.na(FertilityRate), !is.na(LifeExpectancy)) %>%
+  select(FertilityRate, LifeExpectancy) %>% summarise_all(funs(mean))
+# Africa averages
+world %>% filter(Year == 2010, Region == 'Africa', !is.na(FertilityRate), !is.na(LifeExpectancy)) %>%
+  select(FertilityRate, LifeExpectancy) %>% summarise_all(funs(mean))
+```
+
+We see a lot of stagnation and even declination in the 90's and early 2000's in a majority of African countries, as the terrible HIV epidemic begins to outbreak in the early 90's, bringing down life expectancies. Meanwhile, other countries around the world are inheriting the practice of having fewer children, and as a result move up quite rapidly over the following years in life expectancy. With each of these observations, it is important to note that any investments we make in progress and development are _long-term_. In other words, for changes occuring in one year might not show an impact until the following decade.  
+
+In the late 2000's, we can see the clustering forming around 70.9 years and 2.86 births per woman, with Africa making a huge jump to "catch back up" to the rest of the world, eventually ending up at 61.9 years and 4.51 children in 2010. On average, Africa has shrunk the gap to a life discrepancy of only 9 years, and an average fertility rate of 1.65 (compare to 15.8 years and 3.8 births in 1990); this might be suggesting that we are no longer as divided into industrialized versus developing countries as we once were. The changes we observe could be shrinking quite rapidly thanks to advancements in medicine, technology, and general education; we can dig a little deeper into where the differences in countries and regions are coming from, and where this social construct of "two" types of countries came from...and where they're going.  
+
+To more closely observe the division of worlds, and how this divide might be narrowing, we need to define a few metrics that will be useful in measuring changes. As was noted before, _"investments in progress"_ are long-term developments. What are these "progress" metrics, exactly? Talking with an economist, they might note the importance of Growth Domestic Product (GDP), working hours, government health expenditure, or inflation as a few measurements of a country's well-being. On the other hand, a social scientist might be strong a proponent for measuring child mortality and fertility rates, carbon dioxide (CO2) emissions, the prevalance of diseases such as HIV, life expectancy from birth, or the number of people living in poverty. To obtain the most accurate and well-rounded picture of development as a whole, we will observe a variety of comparisons covering all of these economic and health development dimensions.  
+
+```{r, eval=FALSE}
+# label country with highest/lowest life expectancies, highest/lowest GDP's
+
+# find min gdp -- Liberia
+world %>% filter(Year == 1995) %>% arrange(GDPPerCapita) %>% head(1)
+# find max gdp -- Liechtenstein
+world %>% filter(Year > 2000, !is.na(LifeExpectancy), Region != 'Americas') %>% arrange(desc(GDPPerCapita)) %>% head(1)
+# find min life -- Rwanda
+world %>% filter(Year == 1995) %>% arrange(LifeExpectancy) %>% head(1)
+# find max life -- Andorra
+world %>% filter(Year == 2000) %>% arrange(desc(LifeExpectancy)) %>% head(1)
+```
+
+Picking out some countries who ranked amongst the highest and lowest income levels and life expectancies, we can observe the jumps (or subtle movements) being made by these countries. We've also chosen to highlight the US, mainly to serve as a known reference point to see the relations between GDP, government health spending, and life expectancy.  
+
+```{r}
+ggplot(filter(world, !is.na(GDPPerCapita), !is.na(LifeExpectancy), Region != '', Year == 1995),
+       aes(GDPPerCapita, LifeExpectancy, size = HealthExpenditure, color = Region, frame = Year)) +
+  geom_point(alpha = .7) +
+  ggtitle('The impact of a dollar on life longevity in 1995') +
+  # USA (reference point)
+  geom_text(aes(GDPPerCapita, LifeExpectancy), filter(world, Country == 'United States of America', Year == 1995),
+            label = 'USA', color = 'blue3', size = 4, hjust = 0, nudge_x = .05, family = 'Helvetica') +
+  # Congo (lowest GDP)
+  geom_text(aes(GDPPerCapita, LifeExpectancy), filter(world, ISO3 == 'LBR', Year == 1995),
+            label = 'Liberia', color = 'red3', size = 4, hjust = 0, nudge_x = .05, family = 'Helvetica') +
+  # Luxembourg (highest GDP)
+  geom_text(aes(GDPPerCapita, LifeExpectancy), filter(world, ISO3 == 'LUX', Year == 1995),
+            label = 'Lux.', color = 'green4', size = 4, hjust = 0, vjust = 0, nudge_y = .15, nudge_x = .05, family = 'Helvetica') +
+  # Rwanda (lowest life)
+  geom_text(aes(GDPPerCapita, LifeExpectancy), filter(world, ISO3 == 'RWA', Year == 1995),
+            label = 'Rwanda', color = 'red3', size = 4, hjust = 0, nudge_x = .05, family = 'Helvetica') +
+  # Andorra (highest life)
+  geom_text(aes(GDPPerCapita, LifeExpectancy), filter(world, ISO3 == 'AND', Year == 1995),
+            label = 'Andorra', color = 'green4', size = 4, hjust = 1, vjust = 1, nudge_x = -.05, family = 'Helvetica') +
+  # circle around Africa to show dramatic development/change
+  geom_encircle(aes(GDPPerCapita, LifeExpectancy),
+                filter(world, Region == 'Africa', Year == 1995, LifeExpectancy < 67.2331),
+                color = 'red', size = 2, lty = 3, alpha = .3, expand = .05) +
+  theme_minimal() +
+  theme(plot.title = element_text(colour = "steelblue4", size = rel(1.6), face = "bold", family = "Helvetica"),
+        axis.title = element_text(colour = "steelblue4", size = rel(1.4), family = "Helvetica"),
+        axis.text = element_text(colour = "steelblue3", size = rel(1), family = "Helvetica"),
+        legend.title = element_text(colour = "steelblue", size = rel(1.1), family = "Helvetica"),
+        legend.text = element_text(colour = "steelblue4", size = rel(.9), face = "italic",  family = "Helvetica")) +
+  scale_x_continuous('\nGDP Per Capita (USD)', trans = 'log10', labels = dollar) +
+  scale_y_continuous('Life Expectancy (years)\n', breaks = seq(40,85,5), limits = c(40,85)) + # tick every 5 years
+  scale_size_area(max_size = 8, labels = comma, name = 'Health Expenditure\n($ per person)')
+  #scale_size_continuous(labels = comma, name = 'Health Expenditure\n($ per person)')
+
+# ggsave('gdpVlife.png', plot = last_plot())
+```
+
+```{r, eval=FALSE}
+# find proportion of countries from Africa in circle in 1990
+world %>%
+  filter(Region != '', !is.na(LifeExpectancy), Year > 1994) %>%
+  select(Country, Region, LifeExpectancy, Year, GDPPerCapita) %>%
+  group_by(Year) %>%
+  dplyr::mutate(lifeMean = mean(LifeExpectancy)) %>%
+  filter(LifeExpectancy < lifeMean) %>%
+  add_count(Year) %>%
+  filter(Region == 'Africa') %>%
+  add_count(Year) %>%
+  dplyr::mutate(propAfrica = nn / n) %>%
+  distinct(Year, .keep_all = TRUE) %>%
+  select(-c(Country, Region, n, nn))
+
+# find proportion of health expenditure by Europe in 1995 in comparison to the rest of the world
+world %>%
+  filter(Region != '', !is.na(HealthExpenditure), Year == 1995) %>%
+  select(Region, HealthExpenditure) %>%
+  dplyr::mutate(totHealth = sum(HealthExpenditure)) %>%
+  group_by(Region) %>%
+  dplyr::summarise(avgHealth = sum(HealthExpenditure), worldHealth = mean(totHealth)) %>%
+  mutate(healthProp = round(100*(avgHealth/worldHealth),2), percentHealth = cumsum(healthProp)) #add percentHealth as a check
+```
+
+We begin in 1995 because of the lack of records for health expenditures prior to this time period. Initially drawing a circle around countries in Africa having a life expectancy less than the world average for that year, the countries captured can be thought of as "third world". Here, we observe the almost __53%__ of the countries in the circle to be from Africa. In fact, we will show that this proportion actually increases to __56.6%__ of countries that are deemed "third world" by the year 2005, when we finally start seeing a drop back down closer to where it started by 2010. Another important piece to note is the bubble sizes, which represent annual government health expenditure per person. As expected, the bubble sizes increase significantly with an increase in GDP, as countries have more money to allocate towards citizens' well-being. It's interesting to see the significantly higher funding spent on health by European countries in comparison Asia, America, or even the rest of the world; in 1995, Europe alone made up nearly __2/3__ of the _world total_ health expenditure.  
+
+```{r}
+ani.record(reset = TRUE)
+gganimate(
+  ggplot(filter(world, !is.na(GDPPerCapita), !is.na(LifeExpectancy), Region != '', Year > 1994),
+         aes(GDPPerCapita, LifeExpectancy, size = HealthExpenditure, color = Region, frame = Year)) +
+    # add the year BEHIND our points (must be specified first)
+    geom_text(aes(label = Year, x = 3500, y = 65), size = 40, alpha = .2, color = 'grey94', family = 'Helvetica') +
+    geom_point(alpha = .7) +
+    ggtitle('The impact of a dollar on life longevity') +
+    # USA (reference point)
+    geom_text(aes(GDPPerCapita, LifeExpectancy), filter(world, Country == 'United States of America', Year > 1994),
+              label = 'USA', color = 'blue3', size = 4, hjust = 0, nudge_x = .05, family = 'Helvetica') +
+    # Congo (lowest GDP)
+    geom_text(aes(GDPPerCapita, LifeExpectancy), filter(world, ISO3 == 'LBR', Year > 1994),
+              label = 'Liberia', color = 'red3', size = 4, hjust = 0, nudge_x = .05, family = 'Helvetica') +
+    # Luxembourg (highest GDP)
+    geom_text(aes(GDPPerCapita, LifeExpectancy), filter(world, ISO3 == 'LUX', Year > 1994),
+              label = 'Luxembourg', color = 'green4', size = 4, hjust = 0, vjust = 0, nudge_y = .15, nudge_x = .05, family = 'Helvetica') +
+    # Rwanda (lowest life)
+    geom_text(aes(GDPPerCapita, LifeExpectancy), filter(world, ISO3 == 'RWA', Year > 1994),
+              label = 'Rwanda', color = 'red3', size = 4, hjust = 0, nudge_x = .05, family = 'Helvetica') +
+    # Andorra (highest life)
+    geom_text(aes(GDPPerCapita, LifeExpectancy), filter(world, ISO3 == 'AND', Year > 1994),
+              label = 'Andorra', color = 'green4', size = 4, hjust = 1, vjust = 1, nudge_x = -.05, family = 'Helvetica') +
+    # circle around Africa to show dramatic development/change
+    #geom_encircle(aes(GDPPerCapita, LifeExpectancy),
+    #              filter(world, Region == 'Africa', Year > 1994),
+    #              color = 'red', size = 2, lty = 3, alpha = .2, expand = .05) +
+    geom_encircle(data = world %>%
+                    filter(Region != '', !is.na(LifeExpectancy), Year > 1994) %>%
+                    select(Region, LifeExpectancy, Year, GDPPerCapita) %>%
+                    group_by(Year) %>%
+                    dplyr::mutate(lifeMean = mean(LifeExpectancy)) %>%
+                    filter(Region == 'Africa', LifeExpectancy < lifeMean),
+                  aes(GDPPerCapita, LifeExpectancy),
+                  color = 'red', size = 2, lty = 3, alpha = .3, expand = .05) +
+    theme_minimal() +
+    theme(plot.title = element_text(colour = "steelblue4", size = rel(1.8), face = "bold", family = "Helvetica"),
+          axis.title = element_text(colour = "steelblue4", size = rel(1.5), family = "Helvetica"),
+          axis.text = element_text(colour = "steelblue3", size = rel(1), family = "Helvetica"),
+          legend.title = element_text(colour = "steelblue", size = rel(1.5), family = "Helvetica"),
+          legend.text = element_text(colour = "steelblue4", size = rel(1), face = "italic",  family = "Helvetica")) +
+    scale_x_continuous('\nGDP Per Capita (USD)', trans = 'log10', labels = dollar) +
+    scale_y_continuous('Life Expectancy (years)\n', breaks = seq(40,85,5), limits = c(40,85)) + # tick every 5 years
+    scale_size_area(max_size = 8, labels = comma, name = 'Health Expenditure\n($ per person)'),
+    #scale_size_continuous(labels = comma, name = 'Health Expenditure\n($ per person)'),
+  interval = .5, ani.width = 1000, ani.height = 500, title_frame = FALSE, 'gdpVlife.mp4' # take out 'year' title at the top
+)
+```
+
+<div class="video_container">
+  <video controls="controls" allowfullscreen="true">
+    <source src="/Users/mitchmaegaard/gdpVlife.mp4" type="video/mp4">
+  </video> 
+</div>
+
+An important trend to note here is the significant increase in health expenditure in countries with a GDP per capita of over $10,000. These countries are living longer, healthier lives due to the luxury of increased access to medicine and general healthcare. However, there has not been much change over the last several years in the industrialized countries and regions such as Europe and the Americas, while we see big movements and a high dispersion of country status throughout Africa and Asia.  
+
+Looking specifically at the African countries, we initially observe a fairly strong linear trend from countries with low income and shorter lives to high incomes and longer lives. We can watch the bubble we've placed around the African countries expand outward in the 2000's, with a general shift up toward some of the "industrialised" countries; the expansion to the right (higher income, no change in life expectancy) is likely a pointer to the HIV epidemic that heavily impacted Africa during this time period, as well as political turmoil and civil wars.  
+
+Looking at the statistic from before, we see the proportion of "third world" countries encapsulated that are considered to be from Africa initially increasing (more non-red dots) until 2005, and then this number starts dropping back off. The main reason for this change is the growth of a few African countries, while others remain held back from social and economic progress.  
+
+Backtracking slightly, we can verify our assumption from above about the HIV outbreak in the late 90's through the early 2000's that wreaked havoc on Africa in particular. We'll plot two progress metrics, GDP per capita versus the number of people living with HIV, to see how the epidemic affected a very specific population much more than others. What we'll expect is a lot of vertical movement, and not much horizontally as HIV is a rapidly-changing statistic, and GDP is (generally) not.  
+
+```{r}
+ani.record(reset = TRUE)
+gganimate(
+  ggplot(filter(world, !is.na(GDPPerCapita), !is.na(HIV), Region != ''),
+         aes(GDPPerCapita, HIV, color = Region, size = HIV, frame = Year)) +
+    ggtitle('Wealth versus the HIV outbreak') +
+    # Year label
+    geom_text(aes(label = Year, x = 25000, y = 3000000), size = 40, alpha = .2, color = 'grey94', family = 'Helvetica') +
+    geom_point(alpha = .5) +
+    # USA (reference point)
+    geom_text(aes(GDPPerCapita, HIV), filter(world, Country == 'United States of America'),
+              label = 'USA', color = 'blue3', size = 5, vjust = .5, hjust = 0, nudge_x = .1, family = 'Helvetica') +
+    # South Africa, highest HIV
+    geom_text(aes(GDPPerCapita, HIV), filter(world, ISO3 == 'ZAF'),
+              label = 'South Africa', color = 'firebrick3', size = 5, vjust = .5, hjust = 0, nudge_x = .1, family = 'Helvetica') +
+    # Nigeria
+    geom_text(aes(GDPPerCapita, HIV), filter(world, ISO3 == 'NGA'),
+              label = 'Nigeria', color = 'firebrick3', size = 5, vjust = .5, hjust = 0, nudge_x = .1, family = 'Helvetica') +
+    # Kenya
+    geom_text(aes(GDPPerCapita, HIV), filter(world, ISO3 == 'KEN'),
+              label = 'Kenya', color = 'firebrick3', size = 5, vjust = .5, hjust = 0, nudge_x = .1, family = 'Helvetica') +
+    # India
+    geom_text(aes(GDPPerCapita, HIV), filter(world, ISO3 == 'IND'),
+              label = 'India', color = 'forestgreen', size = 5, vjust = .5, hjust = 0, nudge_x = .1, family = 'Helvetica') +
+    # France
+    geom_text(aes(GDPPerCapita, HIV), filter(world, ISO3 == 'FRA'),
+              label = 'France', color = 'orange3', size = 5, vjust = .5, hjust = 0, nudge_x = .1, angle = 45, family = 'Helvetica') +
+    # Germany
+    geom_text(aes(GDPPerCapita, HIV), filter(world, ISO3 == 'DEU'),
+              label = 'Germany', color = 'orange3', size = 5, vjust = .5, hjust = 0, nudge_x = .1, angle = 45, family = 'Helvetica') +
+    theme_minimal() +
+    theme(plot.title = element_text(colour = "steelblue4", size = rel(1.8), face = "bold", family = "Helvetica"),
+        axis.title = element_text(colour = "steelblue4", size = rel(1.5), family = "Helvetica"),
+        axis.text = element_text(colour = "steelblue1", size = rel(1), family = "Helvetica"),
+        legend.title = element_text(colour = "steelblue", size = rel(1.5), family = "Helvetica"),
+        legend.text = element_text(colour = "steelblue4", size = rel(1), face = "italic",  family = "Helvetica")) +
+    scale_x_continuous('\nGDP per Capita (USD)', labels = dollar) +
+    scale_y_continuous('HIV Prevalence\n(people living with HIV)\n', labels = comma) +
+    scale_size_area(max_size = 8, name = 'Number of people\nliving with HIV', labels = comma),
+  interval = .6, ani.width = 1000, ani.height = 500, title_frame = FALSE, 'gdpVHIV.mp4'
+)
+```
+
+<div class="video_container">
+  <video controls="controls" allowfullscreen="true">
+    <source src="/Users/mitchmaegaard/gdpVHIV.mp4" type="video/mp4">
+  </video> 
+</div>
+
+```{r, eval=FALSE}
+# label some of the top countries to show their path
+world %>% filter(Year == 2010) %>% arrange(desc(HIV)) %>% head(3)
+```
+
+By 2010, the three countries with the highest number of people living with HIV were from Africa. An important trend to note here is _who_ exactly was affected; aside from the United States, the only countries with more than 500,000 people having HIV were those that also had a GDP per capita under $5,000. Seeing the state in 2010, we can tell that this is still an ongoing issue, and one resultion could be increased health funding and education to countries in need (e.g. Kenya, India, Nigeria, South Africa). However, we should keep in mind that this was just an confirmation of an assumption about the gap forming in African countries in the later 2000's, and should not be taken as a key negative difference between first and third world countries; we can take the United States into account as a verification of this statement.  
+
+A major discrepancy between the two types of countries we observed earlier was in child mortality rates. Highlighting averages from the different regions of the world, the first thing that stood out was the significantly higher rate in Africa in the early 90's, which unfortunately remains true through our most current data recorded in 2010. But, is child mortality expressed as a _proportion_ alone a sufficient metric of a country's social progress?  
+
+```{r}
+# show trendlines by country, include metrics on % change in 5-10 year intervals
+ani.record(reset = TRUE)
+gganimate(
+  ggplot(data = world %>%
+           filter(Region != '', !is.na(FertilityRate), !is.na(ChildMortality)) %>%
+           select(Region, Year, FertilityRate, ChildMortality, TotalPopulation) %>%
+           group_by(Region, Year) %>%
+           summarise_all(funs(mean)),
+         aes(Year, ChildMortality, color = Region, frame = Year, cumulative = TRUE)) +
+  # mortality rate = deaths/1000 children
+  ggtitle('Deaths in children ages 5 and under (per 1,000 born)') +
+  geom_point(aes(size = FertilityRate), alpha = .7) +
+  geom_line(size = 2, alpha = .2) +
+  theme_minimal() +
+  theme(plot.title = element_text(colour = "steelblue4", size = rel(1.8), face = "bold", family = "Helvetica"),
+        axis.title = element_blank(),
+        axis.text.x = element_text(color = 'steelblue3', size = rel(1.5), family = 'Helvetica'),
+        axis.text.y = element_text(colour = "steelblue3", size = rel(1.2), family = "Helvetica"),
+        legend.title = element_text(colour = "steelblue", size = rel(1.5), family = "Helvetica"),
+        legend.text = element_text(colour = "steelblue4", size = rel(1.2), face = "italic",  family = "Helvetica")) +
+  scale_size_area(max_size = 6, name = 'Fertility Rate\n(children per woman)'),
+  interval = 1.5, ani.width = 1000, ani.height = 500, title_frame = FALSE, 'yearVchildmort.mp4'
+)
+```
+
+<div class="video_container">
+  <video controls="controls" allowfullscreen="true">
+    <source src="/Users/mitchmaegaard/yearVchildmort.mp4" type="video/mp4">
+  </video> 
+</div>
+
+```{r, eval=FALSE}
+# find % change in child mortality for all regions every 5 years
+world %>%
+  filter(Region != '', !is.na(ChildMortality)) %>%
+  select(Country, Region, Year, ChildMortality) %>%
+  dplyr::mutate(deltaChildMortality = ifelse(Year == (lead(Year) - 1) & (lead(Country) == Country),
+                                        round(100*(lead(ChildMortality) - ChildMortality)/ChildMortality,2), NA)) %>%
+  # sum decline in child mortality until we get to a new country, then restart
+  dplyr::mutate(totdeltaChildMort = ave(deltaChildMortality, rev(cumsum(rev(is.na(deltaChildMortality)))), FUN=cumsum)) %>%
+  filter(Year %in% c(1990, 1995, 2000, 2005, 2009)) %>% # could do with seq(1990, 2010, 5), but we want 2009 as well
+  group_by(Region, Year) %>%
+  dplyr::summarise(MortalityChange = mean(totdeltaChildMort, na.rm = TRUE),
+                   maxChange = min(totdeltaChildMort, na.rm = TRUE),
+                   minChange = max(totdeltaChildMort, na.rm = TRUE)) %>%
+  # find % difference between top and bottom country
+  dplyr::mutate(changeRange = minChange - maxChange) #%>%
+  # add a graph to visualize the data
+  ggplot(data = ., aes(Year, MortalityChange, color = Region)) +
+  ggtitle('Rate of change of child mortality') +
+  geom_point(aes(size = changeRange), alpha = .7) +
+  geom_line(alpha = .3) +
+  theme_minimal() +
+  theme(plot.title = element_text(colour = "steelblue4", size = rel(1.7), face = "bold", family = "Helvetica"),
+        axis.title.y = element_text(color = 'steelblue3', size = rel(1.2), family = 'Helvetica'),
+        axis.title.x = element_blank(),
+        axis.text.x = element_text(color = 'steelblue3', size = rel(1.5), family = 'Helvetica'),
+        axis.text.y = element_text(colour = "steelblue3", size = rel(1), family = "Helvetica"),
+        legend.title = element_text(colour = "steelblue", size = rel(1.2), family = "Helvetica"),
+        legend.text = element_text(colour = "steelblue4", size = rel(1), face = "italic",  family = "Helvetica")) +
+  labs(y = 'Cumulative decline beginning in 1995\n') +
+  scale_size_area(max_size = 8, name = '% difference between\nhigh and low countries')
+```
+
+On average, child mortality has _declined_ consistently across all regions from 1990 to 2010 (except for one small blip in 2010). We initially observe Africa to be significantly higher than the rest of the world, which fits our viewpoint of labeling them as a "third world" country. However, note the significant rate of change in Africa (53% decline from 1990) in comparison to the rest of the world; although proportionally they were still behind the rest of the world in 2010, they continue to show rapid improvements while the rest of the world has seemingly stagnated and clustered around a 2.5% child mortality rate. This is quite impressive, and shows that they could potentially join the "western world" in the coming years with continual access to and advancements in medicine, technology, and quality of life. We can also observe the correlation between a high fertility rate (number of births per woman) and a low child mortality rate (death of children under 5 years); picking out Europe and Africa in particular, we can see the dramatic difference in family size and fatalities.  
+
+As the previous plot simply showed a world average, it would be naiive to think that there aren't discrepancies (outliers or leverage points) within regions that could drag the statistics in a different direction. To illustrate this fact, we'll now take a moment to zoom in on a few different countries in Africa; this should also indicate where our greatest improvements in child mortality rates are coming from, and where there is still much needed assistance.  
+
+```{r}
+# Too many to graph all of them! Choose a handful of countries that have a range of low, high, rapid improvement, and stagnation
+
+# try to add in countries from before as a comparison factor!
+ani.record(reset = TRUE)
+gganimate(
+  ggplot(data = world %>%
+           filter(Region == 'Africa', !is.na(FertilityRate), !is.na(ChildMortality), ISO3 %in% c('COD','GHA','KEN','TCD','EGY','MAR')) %>%
+           select(Country, Year, FertilityRate, ChildMortality, TotalPopulation) %>%
+           group_by(Country, Year) %>%
+           summarise_all(funs(mean)),
+         aes(Year, ChildMortality, color = Country, frame = Year, cumulative = TRUE)) +
+  ggtitle('Deaths in children ages 5 and under (per 1,000 born)') +
+  geom_point(aes(size = FertilityRate), alpha = .7) +
+  geom_line(size = 2, alpha = .2) +
+  theme_minimal() +
+  theme(plot.title = element_text(colour = "steelblue4", size = rel(1.8), face = "bold", family = "Helvetica"),
+        axis.title = element_blank(),
+        axis.text = element_text(colour = "steelblue1", size = rel(1), family = "Helvetica"),
+        legend.title = element_text(colour = "steelblue", size = rel(1.5), family = "Helvetica"),
+        legend.text = element_text(colour = "steelblue4", size = rel(1), face = "italic",  family = "Helvetica")) +
+    scale_size_area(guide = FALSE, max_size = 6),
+  interval = 1.5, ani.width = 1000, ani.height = 500, title_frame = FALSE, 'yearVchildmortAfrica.mp4'
+)
+```
+
+<div class="video_container">
+  <video controls="controls" allowfullscreen="true">
+    <source src="/Users/mitchmaegaard/yearVchildmortAfrica.mp4" type="video/mp4">
+  </video> 
+</div>
+
+We can see the huge discrepancy between countries even _within_ Africa, so it is not fair to classify the region as a whole as _"third world"_. Several countries such as Chad and Congo have held up child mortality rates and have only recently started seeing significant improvements, while Egypt and Morocco are contenders with the average European country and beating out the rest of the world averages (2.5% child mortality). Interestingly enough, we can see the same relationship between large family size and high mortality rates, which we can look at on an even wider scale.  
+
+Thus far, we've been provided with evidence that the gap between the "developing" and "western" world is shrinking. Adding labels for the country classifications, we can witness just how rapidly the entire __world__, not even just the third world countries, is making huge leaps in social progress.  
+
+```{r}
+ani.record(reset = TRUE)
+gganimate(
+  ggplot(filter(world, !is.na(FertilityRate), !is.na(ChildMortality), !is.na(TotalPopulation), Region != ''),
+         aes(FertilityRate, ChildMortality, size = TotalPopulation, color = Region, frame = Year)) +
+    geom_text(aes(label = Year, x = 4.3, y = 175), size = 40, alpha = .2, color = 'grey94', family = 'Helvetica') +
+    # add rectangle (BEFORE POINTS) to specify 'developing' countries
+    annotate('rect', xmin = 5, xmax = 8.5, ymin = 95, ymax = 340, alpha = .05, color = 'firebrick3', fill = 'firebrick3') +
+    annotate('text', x = 6, y = 320, label = '"Developing"', family = 'Helvetica', size = 7, color = 'firebrick3') +
+    # add box to specify 'western'
+    annotate('rect', xmin = .5, xmax = 4.25, ymin = 0, ymax = 115, alpha = .05, color = 'forestgreen', fill = 'forestgreen') +
+    annotate('text', x = 1.5, y = 95, label = '"Western"', family = 'Helvetica', size = 7, color = 'forestgreen') +
+    geom_point(alpha = .7) +
+    ggtitle('We\'re winning the war against child mortality') +
+    theme_minimal() +
+    theme(plot.title = element_text(colour = "steelblue4", size = rel(1.8), face = "bold", family = "Helvetica"),
+          axis.title = element_text(colour = "steelblue4", size = rel(1.5), family = "Helvetica"),
+          axis.text = element_text(colour = "steelblue1", size = rel(1), family = "Helvetica"),
+          legend.title = element_text(colour = "steelblue", size = rel(1.5), family = "Helvetica"),
+          legend.text = element_text(colour = "steelblue4", size = rel(1), face = "italic",  family = "Helvetica")) +
+    scale_x_continuous('\nFertility Rate (births per woman)') +
+    scale_y_continuous('Child Mortality (deaths per 1,000 born)\n') +
+    scale_size_area(guide = FALSE, max_size = 20),
+  interval = .5, ani.width = 1000, ani.height = 500, title_frame = FALSE, 'fertilityVchildmort.mp4'
+)
+```
+
+<div class="video_container">
+  <video controls="controls" allowfullscreen="true">
+    <source src="/Users/mitchmaegaard/fertilityVchildmort.mp4" type="video/mp4">
+  </video> 
+</div>
+
+```{r, eval=FALSE}
+# find the proportion in each box in 1990 and 2010
+
+# western world
+world %>%
+  select(Country, Region, Year, ChildMortality, FertilityRate) %>%
+  filter(Region != '', ChildMortality <= 115, FertilityRate <= 4.25, Year == 1990 | Year == 2010) %>%
+  add_count(Year) %>%
+  distinct(Year, n) %>%
+  dplyr::mutate(westProp = round(100*(n/249),2))
+
+# developing world
+world %>%
+  select(Country, Region, Year, ChildMortality, FertilityRate) %>%
+  filter(Region != '', ChildMortality >= 95, FertilityRate >= 5.0, Year == 1990 | Year == 2010) %>%
+  add_count(Year) %>%
+  distinct(Year, n) %>%
+  dplyr::mutate(devProp = round(100*(n/249),2))
+```
+
+The regression we see here is phenomenal, as more and more countries are rapidly joining over to the "western world". In 1990, only about 47% of countries were considered to be industrialized; by 2010, _18% more_ countries were added, bringing the total up to just over 65%. Likewise, approximately 19% of countries in 1990 were deemed "third world", which dropped to a mere 6.4% by 2010. It is obvious that these changes are desireable, but doing a little more analysis, it seems as though our classification of countries that once held true in the 20th century may no longer be applicable, and we should start to drop the pre-conceived notions that there are more than one "types" of countries.  
+
+## Conclusion
+
+Thanks to inspiration by Hans Rosling, we were successfully able to construct interactive graphs that helped to provide insights on past, present, and future socioeconomic progress accross of countries across the world. More impressively, we were able to visualize over 20 years of this progress in a few seconds, which helped ease the interpretation and understanding of the metrics presented. From our analysis, we were able to make strong arguments against the common belief that there still exist both a western and developing world; even as early as 2010, we saw the gap in common factors that intially separated countries converge to just a fraction of what they had been 20 years prior. With sufficient time and an even richer, updated data set, we could extend our analysis to be more current, and possibly take a look at metrics more accurately. It would also be worthwhile to test out graphing on a world map, which might assist in an even simpler interpretation and understanding.  
+
+Again, highlighting some of the key, overarching skills used in the overall exploration, we found database structures, SQL, data cleansing, web scraping, missing value analysis, and animated graphing techniques extremely useful. This project was extremely beneficial in making significant advancements in all of these techniques, and opened the doors to the extensive libraries that R has available for data science.  
+
+### Additional Exploration
+
+The following R code provides a basic structure and breif look into how data can be presented on a world map. Due to time constraints, we were unable to add this information to our presentation; however, we wanted to keep a copy for future research and exploration.  
+
+Animated bubble map:  
+
+```{r, eval=FALSE}
+# Base plot for the world map
+map.world <- ggplot() +
+  borders('world', colour = "gray85", fill = "gray80") +
+  theme_map()
+
+# Now add in specifics regarding what we want to plot and what we want the data to actually look like
+ani.record(reset = TRUE)
+gganimate(
+  map.world +
+  geom_point(data = world,
+             aes(x = Long, y = Lat, size = CO2Emissions, alpha = CO2Emissions, color = Region, frame = Year, cumulative = TRUE)) +
+    scale_size_area(max_size = 20) +
+    scale_alpha_continuous(range = c(.01,1)) +
+    labs(title = 'CO2 Emissions', fill = NULL) +
+    theme(legend.position = 'none'),
+  interval = .8, ani.width = 1000, ani.height = 500 # Set up width, height, and plot interval parameters
+)
+```
+
+Chloropleth map:  
+
+```{r, eval=FALSE}
+# Convenience function to map world data to our plot
+world_mapping <- function(data, x, map.title, color.scale = brewer.pal(7, 'RdPu'), code = 'UN', join.col = 'Code', ...){
+  # Match data by 3-digit code. More accurate than by name
+  sPDF <- joinCountryData2Map(data, joinCode = code, nameJoinColumn = join.col)
+  mapDevice() # Create world map shaped window
+  mapCountryData(sPDF, nameColumnToPlot = x, mapTitle = map.title, colourPalette = color.scale, ...)
+}
+
+# display.brewer.all() -- use to find color scales
+# Example graph:
+#world_mapping(world, 'TotalPopulation', 'Population')
+# Figure out how to get an animation from 1990 to 2010 to see the uptake of HIV
+world_mapping(world[world$Year == 2009,], 'HIV', 'People living with HIV in 2009')
+```
+
+```{r}
+dbDisconnect(con) # Close connection
+rm(list = ls()) # Think globally, act locally
+```
